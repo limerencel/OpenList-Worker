@@ -1,0 +1,109 @@
+name: Sync Upstream & Redeploy
+
+# 每日把上游 OpenListTeam/OpenList-Worker 的 main 同步到本 fork 的 deploy 分支，
+# 有变化就重建（上游内容 + 本地覆盖层）并触发部署。
+#
+# 关键设计（踩坑记录）：
+#  - 绝不硬镜像（git checkout -B deploy upstream/main; push -f）：那会删掉本
+#    仓库独有的 wrangler.deploy.toml 和两个 workflow 文件，同步会自我毁灭。
+#  - 变化检测用「内容比较」而非 commit 比较，否则每天都会误判为有更新。
+#  - GITHUB_TOKEN 推送不会触发其它 workflow，所以部署必须显式 dispatch。
+on:
+  schedule:
+    # 每天 15:00 UTC = 北京时间 23:00
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout deploy branch
+        uses: actions/checkout@v4
+        with:
+          ref: deploy
+          fetch-depth: 0
+
+      - name: Fetch upstream and preserve local overlay files
+        run: |
+          set -e
+          git remote add upstream https://github.com/OpenListTeam/OpenList-Worker.git
+          git fetch upstream main
+          # 本仓库独有的「覆盖层」文件，必须在上游内容之上存活。
+          # 只列上游没有的文件 —— 上游自带的 workflow 让它随上游更新，不要冻结。
+          for f in wrangler.deploy.toml \
+                   .github/workflows/sync-upstream.yml \
+                   .github/workflows/deploy-worker.yml; do
+            if [ -f "$f" ]; then
+              mkdir -p "/tmp/local/$(dirname "$f")"
+              cp "$f" "/tmp/local/$f"
+            fi
+          done
+
+      - name: Detect upstream code changes (content, not commit)
+        id: check
+        run: |
+          # 排除本地覆盖层后再比较内容，避免每天误报「有更新」
+          if git diff --quiet upstream/main HEAD -- \
+               ':(exclude)wrangler.deploy.toml' \
+               ':(exclude).github/workflows/sync-upstream.yml' \
+               ':(exclude).github/workflows/deploy-worker.yml'; then
+            echo "上游无代码变化，跳过。"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "上游有变化，执行同步。"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebuild deploy = upstream/main + local overlay
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B staging "upstream/main"
+
+          # 恢复本地覆盖层
+          cp /tmp/local/wrangler.deploy.toml wrangler.deploy.toml
+          cp /tmp/local/.github/workflows/sync-upstream.yml .github/workflows/sync-upstream.yml
+          cp /tmp/local/.github/workflows/deploy-worker.yml .github/workflows/deploy-worker.yml
+
+          # 用部署配置覆盖上游 wrangler.toml —— 这样 deploy-worker.yml 永远不需要
+          # 做文件改写，配置只在这一个地方定义
+          cp wrangler.deploy.toml wrangler.toml
+
+          git add -A
+          git commit -m "sync upstream $(date -u +%Y-%m-%d) (preserve local overlay)" || true
+
+          git branch -f deploy staging
+          git checkout deploy
+          git push --force origin deploy
+
+      - name: Trigger deploy workflow
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 必须显式 dispatch：GITHUB_TOKEN 的推送不会自动触发其它 workflow
+          gh workflow run deploy-worker.yml \
+            --repo ${{ github.repository }} \
+            --ref deploy
+
+      - name: Notify Telegram (no change)
+        if: steps.check.outputs.changed != 'true'
+        run: |
+          curl -s -m 20 -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}" \
+            -d parse_mode=Markdown \
+            --data-urlencode "text=🔍 *OpenList* 上游无更新，未部署" \
+            -o /dev/null || true

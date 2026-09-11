@@ -1,0 +1,102 @@
+name: Deploy Worker
+
+# 构建并部署 openlist-aki 到 Cloudflare Workers（自定义域名 openlist.itsuhiro.com）。
+#
+# 触发方式：
+#   - deploy 分支 push（手动改配置时）
+#   - sync-upstream.yml 显式 dispatch（GITHUB_TOKEN 推送不会自动触发本 workflow）
+#   - 手动 workflow_dispatch
+on:
+  push:
+    branches:
+      - deploy
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable pnpm
+        run: |
+          corepack enable || true
+          npm install -g pnpm@9.15.4
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build (frontend + edge bundle)
+        run: pnpm run build
+
+      - name: Verify build artifacts
+        run: |
+          set -e
+          test -f dist/index.html || { echo "缺少 dist/index.html"; exit 1; }
+          echo "前端文件数: $(find dist -type f | wc -l)"
+          echo "dist 大小: $(du -sh dist | cut -f1)"
+
+      - name: Confirm deploy config in place
+        run: |
+          set -e
+          grep -q 'name = "openlist-aki"' wrangler.toml || { echo "wrangler.toml 名称不对，中止"; exit 1; }
+          grep -q 'openlist.itsuhiro.com' wrangler.toml || { echo "缺少自定义域名，中止"; exit 1; }
+          echo "wrangler.toml 校验通过"
+
+      - name: Deploy to Cloudflare Workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy
+
+      - name: Verify deployment
+        run: |
+          set -e
+          sleep 15
+          for p in / /api/public/settings; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 30 "https://openlist.itsuhiro.com$p" || echo "000")
+            echo "  $p -> HTTP $code"
+            case "$code" in
+              302|200|401|403) ;;
+              *) echo "验证失败: $p 返回 $code"; exit 1 ;;
+            esac
+          done
+
+      - name: Notify Telegram on success
+        if: success()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          MSG=$(printf '✅ *OpenList* 已自动部署新版本\ncommit: `%s`\n%s' "$SHA" "$RUN_URL")
+          curl -s -m 20 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT}" -d parse_mode=Markdown \
+            --data-urlencode "text=${MSG}" -o /dev/null || true
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          MSG=$(printf '❌ *OpenList* 自动部署失败\n%s' "$RUN_URL")
+          curl -s -m 20 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT}" -d parse_mode=Markdown \
+            --data-urlencode "text=${MSG}" -o /dev/null || true
