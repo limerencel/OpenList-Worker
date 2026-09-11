@@ -34,8 +34,10 @@ jobs:
 
       - name: Enable pnpm
         run: |
-          corepack enable || true
-          npm install -g pnpm@9.15.4
+          corepack enable
+          # corepack 会按 package.json 的 packageManager 字段（pnpm@9.15.4）提供 pnpm，
+          # 不要再 npm install -g（会和 corepack 的 shim 冲突 EEXIST）
+          pnpm --version
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
